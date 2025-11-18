@@ -20,33 +20,42 @@ def query_rag_backend_streaming(user_query: str, placeholder):
 
     # --- 실제 Lambda 함수 URL 호출 로직 (스트리밍) ---
     # 실제 배포 시 이 부분을 활성화하고, 더미 로직을 비활성화하세요.
-    # try:
-    #     # 여기에 실제 Lambda 함수 URL(스트리밍 모드)을 입력하세요.
-    #     api_url = "YOUR_LAMBDA_FUNCTION_URL_HERE"
-    #     payload = {"query": user_query}
-    #
-    #     # stream=True로 설정하여 서버로부터 스트리밍 응답을 받음
-    #     response = requests.post(api_url, json=payload, stream=True)
-    #     response.raise_for_status()
-    #
-    #     full_response = ""
-    #     # 서버가 보내는 각 라인을 순회
-    #     for line in response.iter_lines():
-    #         if line:
-    #             decoded_line = line.decode('utf-8')
-    #             # SSE 데이터 형식인 'data: ...' 에서 실제 데이터를 파싱
-    #             if decoded_line.startswith('data:'):
-    #                 data_str = decoded_line[len('data:'):].strip()
-    #                 if data_str:
-    #                     full_response += data_str
-    #                     # placeholder를 사용해 기존 내용을 새 내용으로 교체 (타이핑 효과)
-    #                     placeholder.markdown(full_response + "▌")
-    #
-    #     # 스트리밍 완료 후, 커서(▌)를 제거하고 최종 답변 표시
-    #     placeholder.markdown(full_response)
-    #
-    # except requests.exceptions.RequestException as e:
-    #     placeholder.error(f"API 호출 중 오류 발생: {e}")
+    try:
+        # 여기에 실제 Lambda 함수 URL(스트리밍 모드)을 입력하세요.
+        api_url = "YOUR_LAMBDA_FUNCTION_URL_HERE"
+        payload = {"query": user_query}
+    
+        # stream=True로 설정하여 서버로부터 스트리밍 응답을 받음
+        response = requests.post(api_url, json=payload, stream=True)
+        response.raise_for_status()
+    
+        full_response = ""
+        # 서버가 보내는 각 라인을 순회
+        for line in response.iter_lines():
+            if line:
+                decoded_line = line.decode('utf-8')
+                # SSE 데이터 형식인 'data: ...' 에서 실제 데이터를 파싱
+                if decoded_line.startswith('data:'):
+                    data_str = decoded_line[len('data:'):].strip()
+                    if data_str:
+                        try:
+                            data = json.loads(data_str)
+                            if 'text' in data:
+                                full_response += data['text']
+                                # placeholder를 사용해 기존 내용을 새 내용으로 교체 (타이핑 효과)
+                                placeholder.markdown(full_response + "▌")
+                            elif 'error' in data:
+                                placeholder.error(f"백엔드 오류: {data['error']}")
+                                break # 에러 발생 시 스트리밍 중단
+                        except json.JSONDecodeError:
+                            # 가끔 빈 데이터나 잘못된 형식의 데이터가 올 수 있으므로 무시
+                            pass
+    
+        # 스트리밍 완료 후, 커서(▌)를 제거하고 최종 답변 표시
+        placeholder.markdown(full_response)
+    
+    except requests.exceptions.RequestException as e:
+        placeholder.error(f"API 호출 중 오류 발생: {e}")
     # --- 실제 API Gateway 호출 로직 끝 ---
 
     # --- MVP를 위한 더미 스트리밍 응답 (실제 배포 시 이 부분을 비활성화하세요) ---

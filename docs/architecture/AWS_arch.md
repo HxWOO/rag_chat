@@ -42,13 +42,13 @@ Lambda 1은 (1) 원본 텍스트 청크, (2) 페이지 번호 메타데이터, (
 
 사용자가 EC2에서 실행 중인 Streamlit UI에 질문("엔진 오일 점검 주기는?")을 입력하고 '전송' 버튼을 누릅니다.
 
-API 호출 (API Gateway):
+API 호출 (Lambda 함수 URL):
 
-Streamlit 앱은 이 질문을 JSON 형식으로 API Gateway 엔드포인트에 POST 요청으로 전송합니다.
+Streamlit 앱은 이 질문을 JSON 형식으로 Lambda 함수 URL에 POST 요청으로 전송합니다.
 
 RAG 로직 실행 (Lambda 2):
 
-API Gateway는 **Lambda-Query-RAG-Function**을 트리거합니다.
+이 요청은 **Lambda-Query-RAG-Function**을 직접 트리거합니다.
 
 Lambda 2가 실제 RAG의 두뇌 역할을 합니다.
 
@@ -62,21 +62,23 @@ Lambda 2는 이 '질문 벡터'와 가장 유사한 벡터를 OpenSearch Serverl
 
 OpenSearch는 가장 관련성 높은 상위 5개의 청크(우리가 저장해 둔 '테이블 텍스트' 포함)와 해당 페이지 번호를 Lambda 2에 반환합니다.
 
-답변 생성 (Bedrock - Claude):
+답변 생성 및 스트리밍 (Bedrock - Claude & Lambda Response Streaming):
 
 Lambda 2는 검색된 근거 청크들과 원본 질문을 조합하여 **프롬프트(Prompt)**를 만듭니다.
 
-이 프롬프트를 Amazon Bedrock (Claude 3 Sonnet 모델) API로 전송하여 "이 근거(컨텍스트)를 바탕으로 질문에 답해줘"라고 요청합니다.
+이 프롬프트를 **스트리밍 모드**로 Amazon Bedrock (Claude 3 Sonnet 모델) API에 전송하여 "이 근거(컨텍스트)를 바탕으로 질문에 답해줘"라고 요청합니다.
 
-답변 반환 (Lambda → API Gateway → UI):
+Lambda 함수는 **Lambda 응답 스트리밍(Response Streaming)** 기능을 사용하도록 설정됩니다.
 
-Claude가 생성한 자연스러운 답변("엔진 오일 레벨은 매 10시간 또는 매일 점검해야 합니다.")과 근거가 된 '페이지 번호'를 Lambda 2가 JSON 형식으로 API Gateway에 반환합니다.
+Bedrock이 답변을 토큰 단위로 생성하면, Lambda는 각 토큰을 **SSE(Server-Sent Events)** 형식(`data: ...\n\n`)으로 감싸 즉시 `yield` 키워드를 통해 스트림으로 반환합니다.
 
-API Gateway는 이 JSON을 다시 Streamlit UI(EC2)로 전달합니다.
+스트리밍 응답 반환 (Lambda → UI):
+
+Lambda 함수는 스트림을 클라이언트(Streamlit UI)에 직접 전달합니다.
 
 결과 표시 (UI on EC2):
 
-Streamlit UI가 JSON 응답을 받아 사용자 화면에 답변과 출처를 표시합니다.
+Streamlit UI는 SSE 스트림을 실시간으로 수신하여, 마치 타이핑을 치는 것처럼 답변과 출처를 화면에 점진적으로 표시합니다.
 
 ---
 
@@ -117,7 +119,7 @@ Streamlit UI가 JSON 응답을 받아 사용자 화면에 답변과 출처를 �
     *   `인터넷` → `ALB (Public Subnet)` → `Streamlit UI (Private Subnet)`
 
 2.  **RAG 기능 요청**:
-    *   `Streamlit UI (Private Subnet)` → `API Gateway` → `RAG-query Lambda (Private Subnet)`
+    *   `Streamlit UI (Private Subnet)` → `Lambda 함수 URL` → `RAG-query Lambda (Private Subnet)`
 
 3.  **백엔드 내부 통신**:
     *   `Lambda (Private Subnet)` ↔ `OpenSearch Endpoint (Private Subnet)`
