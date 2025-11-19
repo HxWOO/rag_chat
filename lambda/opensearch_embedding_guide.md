@@ -31,7 +31,14 @@ Lambda를 실행하기 전에 **단 한 번만** 이 작업을 수행하면 됩�
         "type": "text"
       },
       "metadata": {
-        "type": "object"
+        "properties": {
+          "source": {
+            "type": "keyword"
+          },
+          "chunk_id": {
+            "type": "integer"
+          }
+        }
       }
     }
   }

@@ -3,19 +3,25 @@
 import json
 import os
 import boto3
-from opensearchpy import OpenSearch, RequestsHttpConnection
+from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 
 # --- 환경 변수 ---
 OPENSEARCH_HOST = os.environ['OPENSEARCH_HOST']
 OPENSEARCH_INDEX = os.environ['OPENSEARCH_INDEX']
 BEDROCK_EMBED_MODEL_ID = os.environ.get('BEDROCK_EMBED_MODEL_ID', 'amazon.titan-embed-text-v1')
 BEDROCK_LLM_MODEL_ID = os.environ.get('BEDROCK_LLM_MODEL_ID', 'anthropic.claude-v2:1')
+AWS_REGION = os.environ.get('AWS_REGION')
 
 # --- AWS 클라이언트 초기화 ---
 bedrock = boto3.client('bedrock-runtime')
+
+# OpenSearch 클라이언트 설정 (IAM 인증 사용)
+credentials = boto3.Session().get_credentials()
+auth = AWSV4SignerAuth(credentials, AWS_REGION, 'aoss') # 'aoss'는 OpenSearch Serverless를 의미
+
 opensearch_client = OpenSearch(
     hosts=[{'host': OPENSEARCH_HOST, 'port': 443}],
-    http_auth=('user', 'password'),
+    http_auth=auth, # IAM 인증을 위해 AWSV4SignerAuth 객체 사용
     use_ssl=True,
     verify_certs=True,
     connection_class=RequestsHttpConnection,
