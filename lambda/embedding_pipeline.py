@@ -20,6 +20,9 @@ OPENSEARCH_INDEX = os.environ['OPENSEARCH_INDEX']       # OpenSearch 인덱스 �
 BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'amazon.titan-embed-text-v1') # Bedrock Embedding 모델 ID
 AWS_REGION = os.environ.get('AWS_REGION') # Lambda 실행 환경에서 자동으로 설정됨
 
+# --- 상수 ---
+MAX_CHUNK_SIZE = 1000 # 청크의 최대 문자 수
+
 # --- AWS 클라이언트 초기화 ---
 s3 = boto3.client('s3')
 bedrock = boto3.client('bedrock-runtime')
@@ -38,44 +41,59 @@ opensearch_client = OpenSearch(
     timeout=300
 )
 
-def chunk_markdown(text):
+def chunk_markdown(page_chunks):
     """
-    생성된 마크다운 텍스트를 헤더(h1~h6) 기준으로 청킹합니다.
+    페이지 청크 목록을 받아, 각 페이지의 텍스트를 더 작은 청크로 분할합니다.
+    헤더(h1~h6) 기준으로 1차 청킹하고, 각 청크가 MAX_CHUNK_SIZE를 초과하면
+    단락(이중 개행) 기준으로 2차 청킹합니다.
+    (청크, 페이지 번호)를 yield합니다.
     """
-    # Markdown 헤더(h1~h6)를 기준으로 텍스트를 분할합니다.
-    # 헤더 자체도 청크의 시작 부분에 포함시킵니다.
-    # (^(#){1,6} .+)는 라인의 시작에서 #, ##, ... ###### 다음에 공백과 텍스트가 오는 패턴을 찾습니다.
-    # re.MULTILINE 플래그는 ^가 각 라인의 시작에서 매치되도록 합니다.
-    split_pattern = r'(^(#){1,6} .*)'
-    
-    # re.split은 구분자(패턴)를 포함한 리스트를 반환하지 않으므로,
-    # 먼저 finditer를 사용해 모든 헤더의 위치를 찾습니다.
-    headers = list(re.finditer(split_pattern, text, re.MULTILINE))
-    
-    if not headers:
-        # 헤더가 없으면 기존 방식(혹은 다른 방식)으로 처리
-        chunks = text.split("\n\n")
-        return [chunk.strip() for chunk in chunks if chunk.strip()]
+    for page_chunk in page_chunks:
+        page_num = page_chunk.get("metadata", {}).get("page_number", 0)
+        text = page_chunk.get("text", "")
+        if not text.strip():
+            continue
 
-    chunks = []
-    start_pos = 0
-    
-    # 첫 번째 헤더 이전의 텍스트를 첫 청크로 추가 (주로 문서 제목 등)
-    first_header_start = headers[0].start()
-    if first_header_start > 0:
-        chunks.append(text[:first_header_start].strip())
-
-    # 각 헤더를 기준으로 텍스트를 분할하여 청크 생성
-    for i in range(len(headers)):
-        header_start = headers[i].start()
+        split_pattern = r'(^(#){1,6} .*)'
+        headers = list(re.finditer(split_pattern, text, re.MULTILINE))
         
-        # 다음 헤더의 시작 위치를 찾거나, 마지막 헤더인 경우 텍스트의 끝까지를 범위로 설정
-        next_chunk_start = headers[i+1].start() if i + 1 < len(headers) else len(text)
-        
-        chunk_content = text[header_start:next_chunk_start].strip()
-        chunks.append(chunk_content)
+        initial_chunks = []
 
-    return [chunk for chunk in chunks if chunk]
+        if not headers:
+            initial_chunks.append(text)
+        else:
+            first_header_start = headers[0].start()
+            if first_header_start > 0:
+                initial_chunks.append(text[:first_header_start].strip())
+
+            for i in range(len(headers)):
+                header_start = headers[i].start()
+                next_chunk_start = headers[i+1].start() if i + 1 < len(headers) else len(text)
+                chunk_content = text[header_start:next_chunk_start].strip()
+                initial_chunks.append(chunk_content)
+
+        for chunk in initial_chunks:
+            if not chunk:
+                continue
+
+            if len(chunk) > MAX_CHUNK_SIZE:
+                paragraph_splits = chunk.split("\n\n")
+                current_sub_chunk = ""
+                for paragraph in paragraph_splits:
+                    if not paragraph.strip():
+                        continue
+                    if len(current_sub_chunk) + len(paragraph) + 2 > MAX_CHUNK_SIZE and current_sub_chunk:
+                        yield (current_sub_chunk.strip(), page_num)
+                        current_sub_chunk = paragraph.strip()
+                    else:
+                        if current_sub_chunk:
+                            current_sub_chunk += "\n\n" + paragraph.strip()
+                        else:
+                            current_sub_chunk = paragraph.strip()
+                if current_sub_chunk:
+                    yield (current_sub_chunk.strip(), page_num)
+            else:
+                yield (chunk, page_num)
 
 def get_embedding(text):
     """Bedrock을 호출하여 주어진 텍스트의 임베딩 벡터를 생성합니다."""
@@ -113,38 +131,41 @@ def lambda_handler(event, context):
         # 2. S3에서 PDF 파일을 다운로드하여 임시 파일로 저장
         s3.download_file(bucket_name, object_key, temp_pdf_path)
         
-        # 3. PDF를 구조화된 마크다운으로 변환
-        # 이 과정에서 테이블, 헤더, 목록 등이 마크다운 형식으로 보존됩니다.
-        markdown_text = pymupdf4llm.to_markdown(temp_pdf_path)
+        # 3. PDF를 페이지별 청크로 변환
+        page_chunks = pymupdf4llm.to_markdown(temp_pdf_path, page_chunks=True)
         
-        if not markdown_text.strip():
+        if not page_chunks:
             print("No text could be extracted from the PDF.")
             return {'statusCode': 200, 'body': json.dumps('No text extracted.')}
 
-        # 4. 마크다운 텍스트를 청크로 분할
-        text_chunks = chunk_markdown(markdown_text)
-        print(f"Extracted and chunked into {len(text_chunks)} markdown chunks.")
-
-        # 5. 각 청크를 임베딩하고 OpenSearch에 저장 (Bulk API 사용)
+        # 4. 각 페이지 청크를 더 작은 단위로 분할하고 OpenSearch에 저장
         actions = []
-        for i, chunk in enumerate(text_chunks):
+        chunk_id_counter = 0
+        text_chunks_generator = chunk_markdown(page_chunks)
+
+        for chunk, page_num in text_chunks_generator:
             vector = get_embedding(chunk)
             
             action = {
                 "_index": OPENSEARCH_INDEX,
                 "_source": {
-                    "text": chunk, # 마크다운 형식의 텍스트
-                    "metadata": {
-                        "source": object_key,
-                        "chunk_id": i
-                    },
+                    "text": chunk,
+                    "source": object_key,
+                    "page": page_num,
+                    "chunk_id": chunk_id_counter,
                     "embedding": vector
                 }
             }
             actions.append(action)
+            chunk_id_counter += 1
 
-        print(f"Generated {len(actions)} actions for bulk indexing.")
+        print(f"Extracted and chunked into {len(actions)} markdown chunks.")
 
+        if not actions:
+            print("No chunks were generated.")
+            return {'statusCode': 200, 'body': json.dumps('No chunks generated.')}
+
+        # 5. Bulk API를 사용하여 OpenSearch에 저장
         success, failed = bulk(opensearch_client, actions)
         
         print(f"Successfully indexed {success} documents.")

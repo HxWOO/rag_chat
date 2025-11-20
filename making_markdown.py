@@ -1,6 +1,10 @@
 import pymupdf4llm
 import os
 import re
+import json
+
+# Define a maximum chunk size (e.g., 1000 characters)
+MAX_CHUNK_SIZE = 1000
 
 def pdf_to_markdown(pdf_path: str) -> str:
     """
@@ -14,42 +18,59 @@ def pdf_to_markdown(pdf_path: str) -> str:
 
 def chunk_markdown(text):
     """
-    생성된 마크다운 텍스트를 헤더(h1~h6) 기준으로 청킹합니다.
+    생성된 마크다운 텍스트를 헤더(h1~h6) 기준으로 1차 청킹하고,
+    각 청크가 MAX_CHUNK_SIZE를 초과하면 단락(이중 개행) 기준으로 2차 청킹합니다.
     """
-    # Markdown 헤더(h1~h6)를 기준으로 텍스트를 분할합니다.
-    # 헤더 자체도 청크의 시작 부분에 포함시킵니다.
-    # (^(#){1,6} .+)는 라인의 시작에서 #, ##, ... ###### 다음에 공백과 텍스트가 오는 패턴을 찾습니다.
-    # re.MULTILINE 플래그는 ^가 각 라인의 시작에서 매치되도록 합니다.
     split_pattern = r'(^(#){1,6} .*)'
-    
-    # re.split은 구분자(패턴)를 포함한 리스트를 반환하지 않으므로,
-    # 먼저 finditer를 사용해 모든 헤더의 위치를 찾습니다.
     headers = list(re.finditer(split_pattern, text, re.MULTILINE))
     
+    initial_chunks = []
+
     if not headers:
-        # 헤더가 없으면 기존 방식(혹은 다른 방식)으로 처리
-        chunks = text.split("\n\n")
-        return [chunk.strip() for chunk in chunks if chunk.strip()]
+        # 헤더가 없으면 전체 텍스트를 하나의 '초기' 청크로 간주
+        initial_chunks.append(text)
+    else:
+        # 첫 번째 헤더 이전의 텍스트를 첫 초기 청크로 추가
+        first_header_start = headers[0].start()
+        if first_header_start > 0:
+            initial_chunks.append(text[:first_header_start].strip())
 
-    chunks = []
-    start_pos = 0
-    
-    # 첫 번째 헤더 이전의 텍스트를 첫 청크로 추가 (주로 문서 제목 등)
-    first_header_start = headers[0].start()
-    if first_header_start > 0:
-        chunks.append(text[:first_header_start].strip())
+        # 각 헤더를 기준으로 초기 청크 생성
+        for i in range(len(headers)):
+            header_start = headers[i].start()
+            next_chunk_start = headers[i+1].start() if i + 1 < len(headers) else len(text)
+            chunk_content = text[header_start:next_chunk_start].strip()
+            initial_chunks.append(chunk_content)
 
-    # 각 헤더를 기준으로 텍스트를 분할하여 청크 생성
-    for i in range(len(headers)):
-        header_start = headers[i].start()
-        
-        # 다음 헤더의 시작 위치를 찾거나, 마지막 헤더인 경우 텍스트의 끝까지를 범위로 설정
-        next_chunk_start = headers[i+1].start() if i + 1 < len(headers) else len(text)
-        
-        chunk_content = text[header_start:next_chunk_start].strip()
-        chunks.append(chunk_content)
+    final_chunks = []
+    for chunk in initial_chunks:
+        if not chunk:
+            continue
 
-    return [chunk for chunk in chunks if chunk]
+        # 만약 초기 청크가 너무 크면, 단락(이중 개행) 기준으로 추가 분할
+        if len(chunk) > MAX_CHUNK_SIZE:
+            paragraph_splits = chunk.split("\n\n")
+            current_sub_chunk = ""
+            for paragraph in paragraph_splits:
+                if not paragraph.strip():
+                    continue
+                # 현재 서브 청크에 단락을 추가했을 때 MAX_CHUNK_SIZE를 초과하면
+                # 현재 서브 청크를 저장하고 새로운 서브 청크 시작
+                if len(current_sub_chunk) + len(paragraph) + 2 > MAX_CHUNK_SIZE and current_sub_chunk:
+                    final_chunks.append(current_sub_chunk.strip())
+                    current_sub_chunk = paragraph.strip()
+                else:
+                    if current_sub_chunk:
+                        current_sub_chunk += "\n\n" + paragraph.strip()
+                    else:
+                        current_sub_chunk = paragraph.strip()
+            if current_sub_chunk: # 남은 서브 청크 추가
+                final_chunks.append(current_sub_chunk)
+        else:
+            final_chunks.append(chunk)
+
+    return [c for c in final_chunks if c] # 최종적으로 비어있는 청크 제거
+
 
 if __name__ == "__main__":
     # 현재 스크립트 파일의 디렉토리를 기준으로 PDF 파일 경로 설정
@@ -64,6 +85,15 @@ if __name__ == "__main__":
         chunks = chunk_markdown(markdown_text)
         for i, chunk in enumerate(chunks[:5]): # 처음 5개 청크만 출력
             print(f"Chunk {i+1}:\n{chunk}\n---")
+
+        # Save chunks to a JSON file
+        json_output_path = os.path.join(script_dir, "chunks.json")
+        with open(json_output_path, 'w', encoding='utf-8') as f:
+            json.dump(chunks, f, ensure_ascii=False, indent=4)
+        print(f"\n--- Chunks saved to {json_output_path} ---")
+        print(f"Total chunks: {len(chunks)}")
+
+
     except FileNotFoundError as e:
         print(e)
     except Exception as e:

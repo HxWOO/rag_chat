@@ -3,25 +3,33 @@
 import json
 import os
 import boto3
+from typing import TypedDict, List
+from string import Template
+
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+from langchain_aws import ChatBedrock
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import SystemMessage, HumanMessage
+
+from . import templates # templates 모듈 임포트
 
 # --- 환경 변수 ---
 OPENSEARCH_HOST = os.environ['OPENSEARCH_HOST']
 OPENSEARCH_INDEX = os.environ['OPENSEARCH_INDEX']
 BEDROCK_EMBED_MODEL_ID = os.environ.get('BEDROCK_EMBED_MODEL_ID', 'amazon.titan-embed-text-v1')
 BEDROCK_LLM_MODEL_ID = os.environ.get('BEDROCK_LLM_MODEL_ID', 'anthropic.claude-v2:1')
-AWS_REGION = os.environ.get('AWS_REGION')
+AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 
 # --- AWS 클라이언트 초기화 ---
-bedrock = boto3.client('bedrock-runtime')
+bedrock_runtime = boto3.client('bedrock-runtime', region_name=AWS_REGION)
 
-# OpenSearch 클라이언트 설정 (IAM 인증 사용)
+# OpenSearch 클라이언트 설정
 credentials = boto3.Session().get_credentials()
-auth = AWSV4SignerAuth(credentials, AWS_REGION, 'aoss') # 'aoss'는 OpenSearch Serverless를 의미
+auth = AWSV4SignerAuth(credentials, AWS_REGION, 'aoss')
 
 opensearch_client = OpenSearch(
     hosts=[{'host': OPENSEARCH_HOST, 'port': 443}],
-    http_auth=auth, # IAM 인증을 위해 AWSV4SignerAuth 객체 사용
+    http_auth=auth,
     use_ssl=True,
     verify_certs=True,
     connection_class=RequestsHttpConnection,
@@ -29,48 +37,91 @@ opensearch_client = OpenSearch(
     timeout=300
 )
 
-def get_embedding(text):
+# LangChain Bedrock LLM 초기화
+llm = ChatBedrock(
+    client=bedrock_runtime,
+    model_id=BEDROCK_LLM_MODEL_ID,
+    model_kwargs={"max_tokens_to_sample": 2048, "temperature": 0.1, "top_p": 0.9},
+    streaming=True
+)
+
+# --- LangGraph 상태 정의 ---
+
+class GraphState(TypedDict):
+    """
+    RAG 파이프라인의 각 단계를 거치며 전달될 데이터의 상태를 정의합니다.
+    """
+    query: str
+    scenario: str # 추가: 쿼리 분석 결과 시나리오
+    embedding: List[float]
+    context_chunks: List[dict]
+    prompt: str
+    generation: str
+
+# --- LangGraph 노드 함수들 ---
+
+def analyze_query_node(state: GraphState) -> GraphState:
+    """사용자 질문의 의도를 분석하여 시나리오를 결정합니다."""
+    print("Node: analyze_query_node")
+    query = state['query']
+    
+    router_prompt = templates.ROUTER_PROMPT_TEMPLATE.substitute(query=query)
+    
+    # LLM을 사용하여 쿼리 분류
+    response = llm.invoke(router_prompt)
+    try:
+        scenario_data = json.loads(response.content)
+        scenario = scenario_data.get("scenario", "general") # 기본값은 general
+    except json.JSONDecodeError:
+        print(f"Error decoding router response: {response.content}")
+        scenario = "general" # 파싱 실패 시 기본값
+    
+    print(f"Query '{query}' classified as scenario: {scenario}")
+    return {"scenario": scenario}
+
+def get_embedding_node(state: GraphState) -> GraphState:
     """Bedrock을 호출하여 주어진 텍스트의 임베딩 벡터를 생성합니다."""
-    body = json.dumps({"inputText": text})
-    response = bedrock.invoke_model(
+    print("Node: get_embedding_node")
+    query = state['query']
+    body = json.dumps({"inputText": query})
+    response = bedrock_runtime.invoke_model(
         body=body,
         modelId=BEDROCK_EMBED_MODEL_ID,
         accept='application/json',
         contentType='application/json'
     )
     response_body = json.loads(response['body'].read())
-    return response_body['embedding']
+    return {"embedding": response_body['embedding']}
 
-def search_opensearch(query_embedding, top_k=3):
+def search_opensearch_node(state: GraphState) -> GraphState:
     """OpenSearch에서 k-NN 검색을 수행하여 가장 유사한 문서 청크를 찾습니다."""
+    print("Node: search_opensearch_node")
+    query_embedding = state['embedding']
     query = {
-        "size": top_k,
+        "size": 3,
         "query": {
             "knn": {
                 "embedding": {
                     "vector": query_embedding,
-                    "k": top_k
+                    "k": 3
                 }
             }
         }
     }
-    
-    print("OpenSearch Query:", json.dumps(query, indent=2))
-    
     response = opensearch_client.search(
         body=query,
         index=OPENSEARCH_INDEX
     )
-    
-    return [hit['_source'] for hit in response['hits']['hits']]
+    hits = response['hits']['hits']
+    return {"context_chunks": [hit['_source'] for hit in hits]}
 
-def construct_prompt(query, context_chunks):
-    """
-    [ENHANCED] 검색된 컨텍스트와 Few-shot 예시를 기반으로 Bedrock LLM에 보낼 프롬프트를 구성합니다.
-    - 역할 부여, 구조적 지침, 퓨샷 예시, 출처 표기 강화를 적용합니다.
-    """
-    
-    # 컨텍스트에 페이지 번호 메타데이터를 포함하여 구성
+def construct_prompt_node(state: GraphState) -> GraphState:
+    """검색된 컨텍스트를 기반으로 Bedrock LLM에 보낼 프롬프트를 구성합니다."""
+    print("Node: construct_prompt_node")
+    query = state['query']
+    context_chunks = state['context_chunks']
+    scenario = state['scenario']
+
     context_parts = []
     for i, chunk in enumerate(context_chunks):
         page_number = chunk.get('metadata', {}).get('page', 'N/A')
@@ -79,169 +130,139 @@ def construct_prompt(query, context_chunks):
         )
     context = "\n\n".join(context_parts)
 
-    # Claude 모델에 최적화된 프롬프트 구조 (역할, 지침, 예시, 실제 과업)
-    prompt = f"""Human: 
-<role>
-당신은 'Bobcat T590' 건설 장비의 기술 매뉴얼을 분석하는 AI 전문가입니다. 당신의 임무는 주어진 <context> 문서 내용에만 근거하여 사용자의 질문에 답변하는 것입니다.
-</role>
-
-<instructions>
-1. 제공된 <context>의 내용을 주의 깊게 분석합니다.
-2. 사용자의 <question>을 이해하고, <context> 내에서만 답변의 근거를 찾습니다.
-3. 답변은 명확하고 간결한 한국어로 작성하며, 필요시 글머리 기호를 사용해 가독성을 높입니다.
-4. **매우 중요**: 답변의 마지막에는 반드시 근거가 된 문서의 페이지 번호를 `(출처: Page X)` 형식으로 포함해야 합니다. 여러 페이지를 참고한 경우 모두 표기합니다. (예: `(출처: Page 45, 48)`)
-5. **매우 중요**: <context> 내용만으로 질문에 답변할 수 없는 경우, 절대로 외부 지식을 사용하지 말고, "매뉴얼에서 관련 정보를 찾을 수 없습니다."라고만 답변합니다. 출처는 표기하지 않습니다.
-</instructions>
-
-<examples>
----
-<example index="1">
-<context>
-<document index="1" page_number="52">
-안전 장비
-운전자는 장비 작동 전 항상 다음 안전 장비를 확인해야 합니다.
-- 좌석 벨트: 마모나 손상이 없는지 확인합니다.
-- 시트 바: 정상적으로 내려오고 올라가는지 확인합니다.
-- 운전실 (ROPS/FOPS): 구조적 손상이 없는지 확인합니다.
-- 안전 표지판: 모든 데칼이 부착되어 있고 읽을 수 있는지 확인합니다.
-</document>
-</context>
-<question>
-T590 로더의 안전 장비 목록에는 무엇이 있나요?
-</question>
-<answer>
-T590 로더에서 운전자가 확인해야 할 안전 장비 목록은 다음과 같습니다.
-- 좌석 벨트
-- 시트 바
-- 운전실 (ROPS/FOPS)
-- 안전 표지판 (데칼)
-(출처: Page 52)
-</answer>
-</example>
----
-<example index="2">
-<context>
-<document index="1" page_number="78">
-엔진 오일 및 필터 사양
-- 등급: API CJ-4
-- 점도: SAE 10W-30
-- 교체 주기: 500시간
-</document>
-</context>
-<question>
-이 장비의 재고는 언제쯤 다시 들어오나요?
-</question>
-<answer>
-매뉴얼에서 관련 정보를 찾을 수 없습니다.
-</answer>
-</example>
----
-</examples>
-
-<task>
-위의 역할, 지침, 예시를 엄격히 따라서 다음 실제 과업을 수행하세요.
-
-<context>
-{context}
-</context>
-
-<question>
-{query}
-</question>
-</task>
-
-Assistant:"""
+    # 시나리오에 따라 프롬프트 템플릿 선택
+    if scenario == "specification":
+        template = templates.SPECIFICATION_QUERY_PROMPT_TEMPLATE
+    else: # "general" 또는 알 수 없는 시나리오
+        template = templates.GENERAL_QUERY_PROMPT_TEMPLATE
     
-    return prompt
-
-def stream_response_from_bedrock(prompt):
-    """Bedrock 스트리밍 API를 호출하고 응답을 yield합니다."""
-    print("Invoking Bedrock with streaming...")
+    prompt = template.substitute(query=query, context=context)
     
-    body = json.dumps({
-        "prompt": prompt,
-        "max_tokens_to_sample": 2048,
-        "temperature": 0.1,
-        "top_p": 0.9,
-    })
+    return {"prompt": prompt}
 
-    response_stream = bedrock.invoke_model_with_response_stream(
-        modelId=BEDROCK_LLM_MODEL_ID,
-        body=body
-    )
+def generate_response_node(state: GraphState):
+    """LLM을 호출하여 최종 답변을 스트리밍 방식으로 생성하고 상태를 업데이트합니다."""
+    print("Node: generate_response_node")
+    prompt = state['prompt']
     
-    for event in response_stream['body']:
-        chunk = json.loads(event['chunk']['bytes'])
-        # SSE 형식에 맞춰 'data:' 접두사를 붙여 yield
-        yield f"data: {json.dumps({'text': chunk['completion']})}\n\n"
+    response_stream = llm.stream(prompt)
+    for chunk in response_stream:
+        yield {"generation": chunk.content}
+
+def handle_no_context_node(state: GraphState) -> GraphState:
+    """
+    검색된 컨텍스트가 없을 때 또는 'greeting' 시나리오일 때 고정된 메시지를 반환합니다.
+    """
+    print("Node: handle_no_context_node")
+    scenario = state.get('scenario')
+    if scenario == 'greeting':
+        return {"generation": templates.GREETING_ANSWER}
+    else:
+        return {"generation": "매뉴얼에서 관련 정보를 찾을 수 없습니다."}
+
+# --- LangGraph 조건부 엣지 ---
+
+def decide_next_step_after_analysis(state: GraphState) -> str:
+    """쿼리 분석 결과에 따라 다음 노드를 결정합니다."""
+    print("Conditional edge: decide_next_step_after_analysis")
+    scenario = state['scenario']
+    if scenario == 'greeting':
+        print("Decision: Scenario is 'greeting', going to 'handle_no_context'")
+        return "handle_no_context"
+    else: # general, specification 등 RAG가 필요한 시나리오
+        print("Decision: Scenario requires RAG, going to 'get_embedding'")
+        return "get_embedding"
+
+def decide_context_path(state: GraphState) -> str:
+    """검색된 컨텍스트의 유무에 따라 다음 노드를 결정합니다."""
+    print("Conditional edge: decide_context_path")
+    if state.get("context_chunks"):
+        print("Decision: context found, proceeding to 'construct_prompt'")
+        return "construct_prompt"
+    else:
+        print("Decision: no context, proceeding to 'handle_no_context'")
+        return "handle_no_context"
+
+# --- 그래프 구성 및 컴파일 ---
+
+workflow = StateGraph(GraphState)
+
+# 노드 추가
+workflow.add_node("analyze_query", analyze_query_node)
+workflow.add_node("get_embedding", get_embedding_node)
+workflow.add_node("search_opensearch", search_opensearch_node)
+workflow.add_node("construct_prompt", construct_prompt_node)
+workflow.add_node("generate_response", generate_response_node)
+workflow.add_node("handle_no_context", handle_no_context_node)
+
+# 엣지 연결
+workflow.set_entry_point("analyze_query")
+workflow.add_conditional_edges(
+    "analyze_query",
+    decide_next_step_after_analysis,
+    {
+        "get_embedding": "get_embedding",
+        "handle_no_context": "handle_no_context" # Greeting 처리
+    }
+)
+workflow.add_edge("get_embedding", "search_opensearch")
+workflow.add_conditional_edges(
+    "search_opensearch",
+    decide_context_path,
+    {
+        "construct_prompt": "construct_prompt",
+        "handle_no_context": "handle_no_context" # 컨텍스트 없음 처리
+    }
+)
+workflow.add_edge("construct_prompt", "generate_response")
+workflow.add_edge("handle_no_context", END)
+workflow.add_edge("generate_response", END)
+
+# 그래프 컴파일
+app = workflow.compile()
+
+# --- Lambda 핸들러 ---
 
 def lambda_handler(event, context):
     """
     Lambda 함수 URL을 통해 트리거되는 스트리밍 핸들러입니다.
-    1. 사용자 질문을 받아 임베딩
-    2. OpenSearch에서 관련 문서 검색
-    3. 검색된 문서를 컨텍스트로 LLM에 프롬프트 전달
-    4. LLM의 응답을 실시간으로 스트리밍
+    LangGraph로 구성된 RAG 파이프라인을 실행하고 결과를 스트리밍합니다.
     """
     print("Lambda handler started.")
     
     try:
-        # 1. 사용자 질문 파싱
         body = json.loads(event.get('body', '{}'))
         query = body.get('query')
         
         if not query:
-            return {
-                'statusCode': 400,
-                'body': json.dumps('Query not found in the request body.')
-            }
-            
+            # 스트리밍 응답 형식으로 에러 반환
+            error_message = json.dumps({'error': 'Query not found in the request body.'})
+            yield f"data: {error_message}\n\n"
+            return
+
         print(f"User query: {query}")
-
-        # 2. 질문을 임베딩
-        query_embedding = get_embedding(query)
         
-        # 3. OpenSearch에서 관련 문서 검색
-        context_chunks = search_opensearch(query_embedding)
+        inputs = {"query": query}
         
-        if not context_chunks:
-            # 관련 문서를 찾지 못한 경우, 고정된 메시지 스트리밍
-            print("No relevant context found in OpenSearch.")
-            message = "문서에서 관련 정보를 찾을 수 없습니다."
-            return (f"data: {json.dumps({'text': message})}\n\n" for _ in range(1))
-
-        # 4. LLM에 보낼 프롬프트 구성
-        prompt = construct_prompt(query, context_chunks)
-        
-        print("Constructed Prompt:", prompt)
-
-        # 5. Bedrock으로부터 스트리밍 응답을 받아 클라이언트에 전달
-        return stream_response_from_bedrock(prompt)
+        # LangGraph 스트림 실행
+        for output in app.stream(inputs, stream_mode="values"):
+            if "generation" in output:
+                chunk = output["generation"]
+                # chunk가 Dict인 경우 (예: LLM 스트림 중간), text 키를 사용
+                if isinstance(chunk, dict) and "text" in chunk:
+                    yield f"data: {json.dumps({'text': chunk['text']})}\n\n"
+                # chunk가 문자열인 경우 (예: handle_no_context), 그대로 사용
+                elif isinstance(chunk, str) and chunk: 
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
 
     except Exception as e:
         print(f"Error during processing: {e}")
         import traceback
         traceback.print_exc()
         error_message = f"Error: {str(e)}"
-        # 에러 발생 시, 클라이언트에 에러 메시지를 스트리밍
-        return (f"data: {json.dumps({'error': error_message})}\n\n" for _ in range(1))
+        yield f"data: {json.dumps({'error': error_message})}\n\n"
 
-# --- 필수 설정 및 권한 ---
-#
-# 1.  **Lambda 함수 URL 설정**:
-#     - 이 Lambda 함수는 '함수 URL'을 통해 호출됩니다.
-#     - 함수 URL의 '호출 모드'를 반드시 **`RESPONSE_STREAM`**으로 설정해야 합니다.
-#
-# 2.  **Lambda 환경 변수**:
-#     - `OPENSEARCH_HOST`: OpenSearch Serverless 컬렉션 엔드포인트.
-#     - `OPENSEARCH_INDEX`: 검색할 인덱스 이름.
-#     - `BEDROCK_EMBED_MODEL_ID`: (선택) 임베딩 모델 ID.
-#     - `BEDROCK_LLM_MODEL_ID`: (선택) 답변 생성 LLM 모델 ID.
-#
-# 3.  **Lambda 실행 역할 (IAM Role) 권한**:
-#     - `AmazonBedrockFullAccess` (또는 `bedrock:InvokeModel` 및 `bedrock:InvokeModelWithResponseStream` 권한).
-#     - OpenSearch Serverless 컬렉션에 대한 읽기 권한 (`aoss:ReadCollectionItems` 등).
-#
-# 4.  **Lambda 배포 패키지 / Layer**:
-#     - 이 코드는 `opensearch-py` 라이브러리를 사용합니다.
-#     - `pip install opensearch-py` 로 라이브러리를 다운로드하여 배포 패키지에 포함시키거나, Lambda Layer로 생성하여 연결해야 합니다.
+# --- 필수 설정 참고 ---
+# 1. Lambda 호출 모드: RESPONSE_STREAM
+# 2. Lambda Layer/Package: langchain, langgraph, langchain_aws, opensearch-py 필요.
+# 3. IAM 권한: Bedrock 및 OpenSearch Serverless 접근 권한 필요.
