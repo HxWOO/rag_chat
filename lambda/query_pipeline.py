@@ -11,7 +11,7 @@ from langchain_aws import ChatBedrock
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from . import templates # templates 모듈 임포트
+import templates # templates 모듈 임포트
 
 # --- 환경 변수 ---
 OPENSEARCH_HOST = os.environ['OPENSEARCH_HOST']
@@ -41,7 +41,7 @@ opensearch_client = OpenSearch(
 llm = ChatBedrock(
     client=bedrock_runtime,
     model_id=BEDROCK_LLM_MODEL_ID,
-    model_kwargs={"max_tokens_to_sample": 2048, "temperature": 0.1, "top_p": 0.9},
+    model_kwargs={"max_tokens": 2048, "temperature": 0.1, "top_p": 0.9},
     streaming=True
 )
 
@@ -225,42 +225,56 @@ app = workflow.compile()
 
 def lambda_handler(event, context):
     """
-    Lambda 함수 URL을 통해 트리거되는 스트리밍 핸들러입니다.
-    LangGraph로 구성된 RAG 파이프라인을 실행하고 결과를 스트리밍합니다.
+    Lambda 함수 URL을 통해 트리거되는 핸들러입니다. (비-스트리밍 방식)
+    LangGraph로 구성된 RAG 파이프라인을 실행하고 결과를 단일 JSON으로 반환합니다.
     """
-    print("Lambda handler started.")
+    print("Lambda handler started (non-streaming).")
     
     try:
         body = json.loads(event.get('body', '{}'))
         query = body.get('query')
         
         if not query:
-            # 스트리밍 응답 형식으로 에러 반환
-            error_message = json.dumps({'error': 'Query not found in the request body.'})
-            yield f"data: {error_message}\n\n"
-            return
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({'error': 'Query not found in the request body.'})
+            }
 
         print(f"User query: {query}")
         
         inputs = {"query": query}
         
-        # LangGraph 스트림 실행
+        full_response = []
+        # LangGraph 스트림을 실행하고 모든 결과를 리스트에 수집
         for output in app.stream(inputs, stream_mode="values"):
             if "generation" in output:
                 chunk = output["generation"]
-                # chunk가 Dict인 경우 (예: LLM 스트림 중간), text 키를 사용
                 if isinstance(chunk, dict) and "text" in chunk:
-                    yield f"data: {json.dumps({'text': chunk['text']})}\n\n"
-                # chunk가 문자열인 경우 (예: handle_no_context), 그대로 사용
+                    full_response.append(chunk['text'])
                 elif isinstance(chunk, str) and chunk: 
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+                    full_response.append(chunk)
+        
+        # 모든 응답 조각을 하나의 문자열로 결합
+        final_text = "".join(full_response)
+        
+        # 최종 결과를 포함한 표준 JSON 응답 반환
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"text": final_text})
+        }
 
     except Exception as e:
         print(f"Error during processing: {e}")
         import traceback
         traceback.print_exc()
         error_message = f"Error: {str(e)}"
-        yield f"data: {json.dumps({'error': error_message})}\n\n"
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({'error': error_message})
+        }
 
 # --- 필수 설정 참고 ---
 # 1. Lambda 호출 모드: RESPONSE_STREAM
