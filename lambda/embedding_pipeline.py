@@ -142,16 +142,32 @@ def lambda_handler(event, context):
         actions = []
         chunk_id_counter = 0
         text_chunks_generator = chunk_markdown(page_chunks)
+        last_text_page_num = None # 마지막으로 텍스트에서 발견된 페이지 번호
 
-        for chunk, page_num in text_chunks_generator:
+        for chunk, page_num_from_pdf in text_chunks_generator:
             vector = get_embedding(chunk)
             
+            page_match = re.search(r'\*\*-(\d+)-\*\*', chunk)
+            effective_page_num = 0
+
+            if page_match:
+                # 텍스트에서 페이지 번호 패턴 발견
+                page_from_text = int(page_match.group(1))
+                last_text_page_num = page_from_text
+                effective_page_num = page_from_text
+            elif last_text_page_num is not None:
+                # 텍스트에서 패턴이 없으면 마지막으로 발견된 번호 사용
+                effective_page_num = last_text_page_num
+            else:
+                # 텍스트에서 페이지 번호를 한 번도 찾지 못했다면 PDF에서 추출한 번호 사용
+                effective_page_num = page_num_from_pdf
+
             action = {
                 "_index": OPENSEARCH_INDEX,
                 "_source": {
                     "text": chunk,
                     "source": object_key,
-                    "page": page_num,
+                    "page": effective_page_num,
                     "chunk_id": chunk_id_counter,
                     "embedding": vector
                 }
