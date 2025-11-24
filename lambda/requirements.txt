@@ -1,7 +1,8 @@
-langchain==0.2.1
-langchain-core==0.2.27
-langchain-community==0.2.1
-langgraph==0.2.0
-langchain-aws==0.1.7
+# It is recommended to install a specific version of langchain 
+# to ensure that dependent libraries (langchain-core, langgraph, etc.) 
+# are installed in compatible versions.
+langchain==1.0.8
 opensearch-py
 boto3
+langgraph
+numpy
