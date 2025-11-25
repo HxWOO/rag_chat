@@ -3,88 +3,144 @@ import streamlit as st
 import requests
 import json
 import time
+import boto3
+import os
+
 # from sseclient import SSEClient # SSEClient는 더 이상 사용하지 않으므로 주석 처리 또는 제거
 
-st.set_page_config(page_title="RAG Chatbot UI", layout="centered")
+st.set_page_config(
+    page_title="Doosan AI Chat",
+    page_icon="https://raw.githubusercontent.com/DoosanBobcat/CI/main/logo/doosan-logo-white.svg",
+    layout="centered",
+)
 
-st.title("📚 RAG 기반 문서 질의응답 시스템")
-st.subheader("궁금한 점을 질문해주세요!")
+st.title("Doosan AI Chat 💬")
 
-# RAG 백엔드 API 호출을 처리하는 함수 (SSE 스트리밍 방식)
-def query_rag_backend(user_query: str, placeholder):
+# --- S3 Upload Logic ---
+def upload_to_s3(file, bucket_name):
     """
-    RAG 백엔드(Lambda 함수 URL)를 호출하고, 단일 JSON 응답을 받아 화면에 표시합니다.
+    Streamlit의 UploadedFile 객체를 S3에 업로드합니다.
+    """
+    try:
+        # AWS 자격 증명 및 리전은 Streamlit secrets에서 가져옵니다.
+        # .streamlit/secrets.toml 파일에 다음과 같이 설정해야 합니다.
+        # [aws]
+        # aws_access_key_id = "YOUR_ACCESS_KEY"
+        # aws_secret_access_key = "YOUR_SECRET_KEY"
+        # aws_region = "YOUR_REGION"
+        # s3_bucket_name = "your-s3-bucket-name"
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
+            aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"],
+            region_name=st.secrets["aws"]["aws_region"],
+        )
+        # 파일 포인터를 처음으로 되돌립니다.
+        file.seek(0)
+        s3_client.upload_fileobj(file, bucket_name, file.name)
+        return True
+    except Exception as e:
+        st.sidebar.error(f"S3 업로드 오류: {e}")
+        return False
+
+# --- Sidebar ---
+with st.sidebar:
+    # 로고 이미지 표시
+    st.image("https://raw.githubusercontent.com/DoosanBobcat/CI/main/logo/doosan-logo-white.svg", width=200)
+    st.title("매뉴얼 업로드")
+    st.write("PDF 매뉴얼을 S3에 업로드하여 AI가 학습할 수 있도록 합니다.")
+
+    uploaded_file = st.file_uploader(
+        "PDF 파일을 선택하세요.", type="pdf", label_visibility="collapsed"
+    )
+
+    if st.button("S3에 업로드"):
+        if uploaded_file is not None:
+            bucket = st.secrets.get("aws", {}).get("s3_bucket_name")
+            if not bucket:
+                st.sidebar.error("S3 버킷 이름이 secrets.toml에 설정되지 않았습니다.")
+            else:
+                with st.spinner("파일을 업로드하는 중입니다..."):
+                    success = upload_to_s3(uploaded_file, bucket)
+                    if success:
+                        st.sidebar.success(f"'{uploaded_file.name}' 업로드 완료!")
+        else:
+            st.sidebar.warning("업로드할 파일을 먼저 선택해주세요.")
+
+# RAG 백엔드 API 호출 및 타이핑 효과 표시 함수
+def stream_response(user_query: str, placeholder):
+    """
+    RAG 백엔드를 호출하고 응답을 받아 placeholder에 타이핑 효과와 함께 표시합니다.
+    성공 시 전체 응답 문자열을, 실패 시 None을 반환합니다.
     """
     if not user_query.strip():
         placeholder.warning("질문을 입력해주세요.")
-        return
+        return None
 
-    # --- 실제 Lambda 함수 URL 호출 로직 (비-스트리밍) ---
     try:
-        # 여기에 실제 Lambda 함수 URL을 입력하세요.
-        # 예시: "https://asdvsd.lambda-url.us-west-2.on.aws/"
-        api_url = ""
+        api_url = "https://i7hhagzpdu73ngapgpychox2xq0gwefp.lambda-url.us-west-2.on.aws/"
         payload = {"query": user_query}
-    
-        # stream=True 제거; 일반적인 POST 요청
         response = requests.post(api_url, json=payload)
-        response.raise_for_status() # HTTP 오류가 발생하면 예외 발생
-        
-        # 전체 응답을 JSON으로 파싱
+        response.raise_for_status()
+
         response_data = response.json()
-        
+
         full_response = ""
-        if 'body' in response_data: # Lambda 프록시 통합 응답 처리
-            body_data = json.loads(response_data['body'])
-            if 'text' in body_data:
-                full_response = body_data['text']
-            elif 'error' in body_data:
+        if "body" in response_data:
+            body_data = json.loads(response_data["body"])
+            if "text" in body_data:
+                full_response = body_data["text"]
+            elif "error" in body_data:
                 placeholder.error(f"백엔드 오류: {body_data['error']}")
-                return
-        elif 'text' in response_data: # Lambda 비-프록시 통합 또는 직접 JSON 응답
-            full_response = response_data['text']
-        elif 'error' in response_data:
-            placeholder.error(f"백엔드 오류: {response_data['error']}")
-            return
+                return None
         else:
             placeholder.error(f"알 수 없는 응답 형식: {response_data}")
-            return
-        
-        # 타이핑 효과 구현
+            return None
+
         current_response_text = ""
         for char in full_response:
             current_response_text += char
             placeholder.markdown(current_response_text + "▌")
-            time.sleep(0.02) # 타이핑 효과 딜레이
-        
-        # 최종 답변 표시 (커서 제거)
+            time.sleep(0.02)
+
         placeholder.markdown(full_response)
-    
+        return full_response
+
     except requests.exceptions.RequestException as e:
         placeholder.error(f"API 호출 중 오류 발생: {e}")
     except json.JSONDecodeError:
         placeholder.error(f"API 응답 파싱 오류: 유효한 JSON이 아닙니다.")
     except Exception as e:
         placeholder.error(f"예상치 못한 오류 발생: {e}")
-    # --- 실제 API Gateway 호출 로직 끝 ---
+
+    return None
 
 
-# 사용자 질문 입력 영역
-user_question = st.text_area(
-    "질문을 입력하세요:",
-    height=100,
-    placeholder="예: AWS Lambda는 무엇인가요? RAG 아키텍처의 장점은 무엇인가요?"
-)
+# --- Main App Logic ---
 
-# 질문하기 버튼
-if st.button("질문하기"):
-    st.markdown("---")
-    st.subheader("답변:")
-    # st.empty()를 사용해 답변이 표시될 영역을 미리 만듦
-    response_placeholder = st.empty()
-    
-    with st.spinner("AI가 답변을 생성중입니다..."):
-        query_rag_backend(user_question, response_placeholder)
+# 세션 상태에 메시지 목록 초기화
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-st.markdown("---")
-st.caption("이 UI는 RAG 시스템의 프론트엔드 MVP입니다. 백엔드 API와 연결하여 실제 동작합니다.")
+# 기록된 메시지 표시
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# 사용자 입력 처리
+if prompt := st.chat_input("궁금한 점을 질문해주세요!"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        response_placeholder = st.empty()
+        with st.spinner("AI가 답변을 생성중입니다..."):
+            full_response = stream_response(prompt, response_placeholder)
+
+        if full_response:
+            st.session_state.messages.append(
+                {"role": "assistant", "content": full_response}
+            )
+
+st.caption("이 UI는 RAG 시스템의 프론트엔드 MVP입니다.")
