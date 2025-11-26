@@ -78,7 +78,7 @@ def stream_response(user_query: str, placeholder):
         return None
 
     try:
-        api_url = "https://i7hhagzpdu73ngapgpychox2xq0gwefp.lambda-url.us-west-2.on.aws/"
+        api_url = ""
         payload = {"query": user_query}
         response = requests.post(api_url, json=payload)
         response.raise_for_status()
